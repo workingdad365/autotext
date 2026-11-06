@@ -4,7 +4,7 @@
 
 <h1 align="center">AutoText</h1>
 
-<p align="center">핫키 한 번으로 자주 쓰는 문구를 입력하는 Windows 트레이 프로그램<br>v1.0.1</p>
+<p align="center">핫키 한 번으로 자주 쓰는 문구를 입력하는 Windows 트레이 프로그램<br>v1.1.0</p>
 
 ---
 
