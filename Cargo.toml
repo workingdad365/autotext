@@ -1,6 +1,6 @@
 [package]
 name = "autotext"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 description = "AutoText - 핫키로 상용구를 입력하는 Windows 트레이 프로그램"
 
