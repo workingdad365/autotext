@@ -117,10 +117,20 @@ impl Snippet {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub snippets: Vec<Snippet>,
+    /// 시작 직후와 하루 한 번 새 버전 자동 확인
+    pub check_updates: bool,
+    /// 다시 알리지 않을 버전 태그 (예: v1.0.1)
+    pub skipped_version: Option<String>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self { snippets: Vec::new(), check_updates: true, skipped_version: None }
+    }
 }
 
 impl Config {
@@ -342,6 +352,9 @@ mod tests {
         assert_eq!(partial.snippets[0].hotkey, Hotkey::default());
         // mode 필드가 없는 기존 설정 호환: 직접 입력으로 처리
         assert_eq!(partial.snippets[0].mode, InputMode::Type);
+        // 업데이트 필드가 없는 기존 설정 호환: 자동 확인 사용
+        assert!(partial.check_updates);
+        assert_eq!(partial.skipped_version, None);
     }
 
     #[test]

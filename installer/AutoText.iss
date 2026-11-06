@@ -13,9 +13,10 @@
 #define AppExe "AutoText.exe"
 #define AppPublisher "drasys"
 #define AppUrl "https://github.com/workingdad365/autotext"
+#define AppIdGuid "{3D065477-9D26-4577-966E-39D2C159AA3C}"
 
 [Setup]
-AppId={{3D065477-9D26-4577-966E-39D2C159AA3C}
+AppId={{#AppIdGuid}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
@@ -57,7 +58,8 @@ english.AutoStart=Start automatically at Windows sign-in
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; Flags: unchecked
-Name: "autostart"; Description: "{cm:AutoStart}"
+; 업그레이드 시에는 앱 설정 창에서 바꾼 자동 실행 상태를 덮어쓰지 않도록 작업을 생략
+Name: "autostart"; Description: "{cm:AutoStart}"; Check: not IsUpgrade
 
 [Files]
 Source: "{#BuildDir}\{#AppExe}"; DestDir: "{app}"; Flags: ignoreversion
@@ -72,12 +74,27 @@ Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 [Run]
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchAfterInstall}"; Flags: nowait postinstall skipifsilent
+; 앱 내 업데이트(/SILENT /RELAUNCH=1)로 설치한 경우 앱을 바로 다시 실행
+Filename: "{app}\{#AppExe}"; Flags: nowait; Check: IsRelaunchRequested
 
 [UninstallRun]
 ; 제거 전 실행 중인 앱 종료
 Filename: "{sys}\taskkill.exe"; Parameters: "/IM {#AppExe} /F"; Flags: runhidden; RunOnceId: "KillApp"
 
 [Code]
+// 같은 AppId 로 이미 설치되어 있는지 여부 (Inno Setup 이 만드는 제거 정보 키 기준)
+function IsUpgrade: Boolean;
+begin
+  Result := RegKeyExists(HKEY_CURRENT_USER,
+    'Software\Microsoft\Windows\CurrentVersion\Uninstall\{#AppIdGuid}_is1');
+end;
+
+// 앱 내 업데이트가 넘기는 /RELAUNCH=1 파라미터 여부
+function IsRelaunchRequested: Boolean;
+begin
+  Result := ExpandConstant('{param:RELAUNCH|0}') = '1';
+end;
+
 // 트레이 앱은 Restart Manager의 정상 종료 요청에 응답하지 않아 강제 종료까지 약 30초 대기하므로 미리 종료
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var

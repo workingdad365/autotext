@@ -17,6 +17,7 @@
   - 직접 입력: 한 글자씩 키 입력으로 전송하며 클립보드를 건드리지 않음
   - 클립보드 붙여넣기: `Ctrl+V` 로 붙여넣은 뒤 기존 클립보드 내용을 복원함
 - **Windows 시작 시 자동 실행**: 설정 창에서 켜고 끌 수 있음
+- **자동 업데이트**: GitHub 릴리스에 새 버전이 올라오면 알리고, 버튼 한 번으로 설치 후 다시 실행함
 - **중복 실행 방지**: 다시 실행하면 이미 실행 중인 프로그램의 설정 창이 열림
 
 ## 설치
@@ -27,6 +28,16 @@
 - 설치 중 바탕 화면 바로 가기, Windows 로그인 시 자동 실행 여부를 선택할 수 있음
 - 실행 중인 AutoText 는 설치 전에 자동으로 종료됨
 - **설정 > 앱** 에서 제거할 수 있으며, 제거해도 상용구 설정 파일은 남음
+
+### 업데이트
+
+- 시작 10초 뒤와 이후 하루 한 번 GitHub 최신 릴리스를 확인함
+- 새 버전이 있으면 설정 창이 열리고 상단에 안내가 표시됨 (자동 확인으로는 실행 중 한 번만 알림)
+  - **지금 설치**: 설치 파일을 내려받아 설치한 뒤 프로그램을 다시 실행함
+  - **이 버전 건너뛰기**: 해당 버전은 자동 확인에서 더 이상 알리지 않음
+- 트레이 메뉴의 **업데이트 확인** 으로 언제든 직접 확인할 수 있음 (건너뛴 버전도 표시됨)
+- 설정 창 하단의 **새 버전 자동 확인** 을 끄면 자동 확인을 하지 않음
+- 업데이트 설치 시 자동 실행 설정은 그대로 유지됨
 
 ## 사용 방법
 
@@ -88,7 +99,9 @@
       "enabled": true,
       "mode": "paste"
     }
-  ]
+  ],
+  "check_updates": true,
+  "skipped_version": null
 }
 ```
 
@@ -100,6 +113,8 @@
 | `hotkey` | 수식키 사용 여부와 트리거 키 |
 | `enabled` | 사용 여부 |
 | `mode` | `type` (직접 입력, 기본값) 또는 `paste` (클립보드 붙여넣기) |
+| `check_updates` | 새 버전 자동 확인 여부 (기본값 `true`) |
+| `skipped_version` | 자동 확인에서 알리지 않을 버전 태그 (예: `"v1.0.1"`) |
 
 자동 실행은 레지스트리 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` 의 `AutoText` 값으로 관리한다.
 exe 를 다른 폴더로 옮긴 경우 한 번 직접 실행하면 등록 경로가 갱신된다.
@@ -133,13 +148,28 @@ cargo test              # 유닛 테스트
 ### 설치 파일 생성과 릴리스
 
 ```powershell
-.\build-installer.ps1             # 릴리스 빌드 후 dist\AutoText-Setup-<버전>.exe 생성
-.\build-installer.ps1 -Install    # 생성 직후 조용히 설치 (검증용)
-.\release.ps1 1.0.0 "릴리스 설명"  # dist 의 설치 파일을 GitHub Release v1.0.0 으로 게시
+.\build-installer.ps1                    # 릴리스 빌드 후 dist\AutoText-Setup-<버전>.exe 생성
+.\build-installer.ps1 -Install           # 생성 직후 조용히 설치 (검증용)
+
+.\release.ps1 "릴리스 설명"              # 버전 자동 증가 (1.0.0 -> 1.0.1) 후 GitHub Release 게시
+.\release.ps1 "릴리스 설명" -Bump minor  # 1.0.1 -> 1.1.0 (major 는 2.0.0)
+.\release.ps1 "릴리스 설명" -NoBump      # 현재 버전 그대로 게시 (게시 실패 후 재시도용)
+.\release.ps1 "릴리스 설명" -DryRun      # 다음 버전만 출력
 ```
 
-- 버전은 `Cargo.toml` 의 `version` 을 따름. `release.ps1` 에 입력한 버전이 이와 다르면 중단함
-- `release.ps1` 은 커밋하지 않은 변경 사항이 있으면 중단하므로, 커밋과 푸시를 마친 뒤 실행해야 함
+`release.ps1` 은 다음 순서로 동작한다. 커밋 전 단계에서 실패하면 버전 변경을 되돌린다.
+
+1. 작업 트리가 깨끗한지, 원격보다 뒤처지지 않았는지, 같은 버전 릴리스가 없는지 확인
+2. `Cargo.toml`, `README.md`, `installer\AutoText.iss` 의 버전 표기 변경
+3. `cargo test` 실행 후 `build-installer.ps1` 로 설치 파일 생성 (`Cargo.lock` 도 갱신됨)
+4. `release vX.Y.Z` 커밋 생성 후 푸시
+5. 설치 파일을 첨부해 GitHub Release 게시. 실행 중인 AutoText 가 이 릴리스를 새 버전으로 감지함
+
+네트워크가 필요한 업데이트 테스트(실제 릴리스 조회와 다운로드)는 기본 테스트에서 제외되어 있다.
+
+```powershell
+cargo test -- --ignored
+```
 
 ### 아이콘 재생성
 
@@ -163,6 +193,7 @@ autotext/
 |   +-- input.rs        # SendInput 기반 직접 입력, 붙여넣기 입력
 |   +-- clipboard.rs    # 클립보드 백업, 설정, 복원
 |   +-- autostart.rs    # 자동 실행 레지스트리 관리
+|   +-- update.rs       # GitHub 릴리스 확인, 설치 파일 다운로드 (WinHTTP)
 |   +-- ui.rs           # 설정 창 (egui)
 +-- installer/
 |   +-- AutoText.iss    # Inno Setup 설치 스크립트
@@ -178,6 +209,7 @@ autotext/
 - **서비스 스레드**: 메시지 전용 창을 만들어 트레이 아이콘과 `RegisterHotKey` 전역 핫키를 처리함. 프로그램이 실행되는 동안 항상 동작함
 - **메인 스레드**: 설정 창 열기 요청이 오면 egui 창을 만들고, 창이 닫히면 다음 요청을 기다림
 - **입력 스레드**: 핫키가 눌릴 때마다 생성됨. 수식키가 모두 떼어질 때까지 기다린 뒤 입력함
+- **업데이트 스레드**: 업데이트 확인, 다운로드 때만 생성됨. 결과는 서비스 스레드에 메시지로 전달함
 
 ### 사용 라이브러리
 
@@ -185,6 +217,6 @@ autotext/
 |---|---|
 | [eframe / egui](https://github.com/emilk/egui) | 설정 창 UI |
 | [tray-icon](https://github.com/tauri-apps/tray-icon) | 트레이 아이콘, 우클릭 메뉴 |
-| [windows](https://github.com/microsoft/windows-rs) | 핫키, 키 입력, 클립보드, 레지스트리 Win32 API |
+| [windows](https://github.com/microsoft/windows-rs) | 핫키, 키 입력, 클립보드, 레지스트리, WinHTTP Win32 API |
 | [serde / serde_json](https://serde.rs) | 설정 파일 직렬화 |
 | [winresource](https://github.com/BenjaminRi/winresource) | exe 아이콘, 버전 정보 리소스 |

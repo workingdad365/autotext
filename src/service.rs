@@ -16,20 +16,35 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, GetSystemMetrics, HWND_MESSAGE,
-    IsIconic, MSG, RegisterClassW, SM_CXSMICON, SM_CYSMICON, SW_RESTORE, SW_SHOW,
-    SetForegroundWindow, ShowWindow, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
-    WM_HOTKEY, WNDCLASSW,
+    IsIconic, KillTimer, MB_ICONINFORMATION, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND, MB_TOPMOST,
+    MESSAGEBOX_STYLE, MSG, MessageBoxW, PostQuitMessage, RegisterClassW, SM_CXSMICON, SM_CYSMICON,
+    SW_RESTORE, SW_SHOW, SetForegroundWindow, SetTimer, ShowWindow, TranslateMessage,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_HOTKEY, WM_TIMER, WNDCLASSW,
 };
-use windows::core::{PCWSTR, w};
+use windows::core::{HSTRING, PCWSTR, w};
 
 use crate::config::{APP_NAME, APP_VERSION, InputMode, key_to_vk};
-use crate::{MainCmd, Shared, input};
+use crate::{MainCmd, Shared, input, update};
 
 pub const SERVICE_CLASS: PCWSTR = w!("AutoText.ServiceWindow");
 /// 설정 변경 후 핫키 재등록 요청
 pub const WM_APP_RELOAD: u32 = WM_APP + 1;
 /// 설정 창 열기 요청 (중복 실행 시 기존 인스턴스에 전달)
 pub const WM_APP_SHOW: u32 = WM_APP + 2;
+/// 업데이트 확인 요청 (wparam 1 이면 수동 확인)
+pub const WM_APP_CHECK_UPDATE: u32 = WM_APP + 3;
+/// 업데이트 확인 작업 완료 (wparam 1 이면 수동 확인)
+const WM_APP_UPDATE_CHECKED: u32 = WM_APP + 4;
+/// 업데이트 상태 변경 후 트레이 메뉴 문구 갱신 요청
+pub const WM_APP_UPDATE_CHANGED: u32 = WM_APP + 5;
+/// 프로그램 종료 요청 (업데이트 설치 시작 후)
+pub const WM_APP_QUIT: u32 = WM_APP + 6;
+
+const TIMER_FIRST_CHECK: usize = 1;
+const TIMER_DAILY_CHECK: usize = 2;
+/// 로그인 직후 네트워크가 준비될 때까지 첫 확인을 미룸
+const FIRST_CHECK_DELAY_MS: u32 = 10_000;
+const DAILY_CHECK_MS: u32 = 24 * 60 * 60 * 1000;
 
 struct State {
     shared: Arc<Shared>,
@@ -37,6 +52,7 @@ struct State {
     hwnd: HWND,
     /// 등록 id -> (상용구 내용, 트리거 가상 키, 입력 방식)
     hotkeys: HashMap<i32, (String, u32, InputMode)>,
+    update_item: MenuItem,
 }
 
 thread_local! {
@@ -61,16 +77,28 @@ fn run(shared: Arc<Shared>, tx: Sender<MainCmd>) {
     shared.service_hwnd.store(hwnd.0 as isize, Ordering::SeqCst);
 
     let open_item = MenuItem::new("설정 열기", true, None);
+    let update_item = MenuItem::new(UPDATE_MENU_CHECK, true, None);
     let quit_item = MenuItem::new("종료", true, None);
     let menu = Menu::new();
-    let _ = menu.append_items(&[&open_item, &PredefinedMenuItem::separator(), &quit_item]);
+    let _ = menu.append_items(&[
+        &open_item,
+        &update_item,
+        &PredefinedMenuItem::separator(),
+        &quit_item,
+    ]);
+    let update_id = update_item.id().clone();
 
     let tray = build_tray(menu);
 
     STATE.with(|s| {
-        *s.borrow_mut() = Some(State { shared, tx, hwnd, hotkeys: HashMap::new() });
+        *s.borrow_mut() = Some(State { shared, tx, hwnd, hotkeys: HashMap::new(), update_item });
     });
     reload_hotkeys();
+
+    unsafe {
+        SetTimer(Some(hwnd), TIMER_FIRST_CHECK, FIRST_CHECK_DELAY_MS, None);
+        SetTimer(Some(hwnd), TIMER_DAILY_CHECK, DAILY_CHECK_MS, None);
+    }
 
     let mut msg = MSG::default();
     loop {
@@ -96,6 +124,8 @@ fn run(shared: Arc<Shared>, tx: Sender<MainCmd>) {
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
             if ev.id == *open_item.id() {
                 open_settings();
+            } else if ev.id == update_id {
+                on_update_menu();
             } else if ev.id == *quit_item.id() {
                 quit(tray);
             }
@@ -174,8 +204,140 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             open_settings();
             LRESULT(0)
         }
+        WM_TIMER => {
+            if wparam.0 == TIMER_FIRST_CHECK {
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), TIMER_FIRST_CHECK);
+                }
+            }
+            start_update_check(false);
+            LRESULT(0)
+        }
+        WM_APP_CHECK_UPDATE => {
+            start_update_check(wparam.0 == 1);
+            LRESULT(0)
+        }
+        WM_APP_UPDATE_CHECKED => {
+            on_update_checked(wparam.0 == 1);
+            LRESULT(0)
+        }
+        WM_APP_UPDATE_CHANGED => {
+            refresh_update_menu();
+            LRESULT(0)
+        }
+        WM_APP_QUIT => {
+            unsafe { PostQuitMessage(0) };
+            LRESULT(0)
+        }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
     }
+}
+
+const UPDATE_MENU_CHECK: &str = "업데이트 확인";
+
+fn with_shared<R>(f: impl FnOnce(&Arc<Shared>) -> R) -> Option<R> {
+    STATE.with(|s| s.borrow().as_ref().map(|st| f(&st.shared)))
+}
+
+/// 백그라운드 스레드에서 최신 릴리스 확인. 자동 확인은 설정이 꺼져 있으면 생략
+fn start_update_check(manual: bool) {
+    let Some(shared) = with_shared(|sh| sh.clone()) else { return };
+    if !manual && !shared.config.lock().unwrap().check_updates {
+        return;
+    }
+    {
+        let mut st = shared.update.lock().unwrap();
+        // 다운로드 중이거나 이미 확인 중이면 중복 실행하지 않음
+        if st.checking || st.progress.is_some() {
+            return;
+        }
+        st.checking = true;
+    }
+    thread::spawn(move || {
+        let result = update::check();
+        shared.update.lock().unwrap().check_result = Some(result);
+        shared.post_service(WM_APP_UPDATE_CHECKED, manual as usize);
+    });
+}
+
+/// 확인 결과 반영. 새 버전이면 트레이 메뉴를 바꾸고 설정 창으로 안내 (자동 확인은 실행 중 한 번만)
+fn on_update_checked(manual: bool) {
+    let Some(shared) = with_shared(|sh| sh.clone()) else { return };
+    let result = {
+        let mut st = shared.update.lock().unwrap();
+        st.checking = false;
+        st.check_result.take()
+    };
+    let Some(result) = result else { return };
+
+    match result {
+        Err(e) => {
+            if manual {
+                message_box(format!("업데이트 정보를 가져오지 못했습니다.\n{e}"), MB_ICONWARNING);
+            }
+        }
+        Ok(None) => {
+            shared.update.lock().unwrap().available = None;
+            refresh_update_menu();
+            if manual {
+                message_box(format!("최신 버전({APP_VERSION})을 사용 중입니다."), MB_ICONINFORMATION);
+            }
+        }
+        Ok(Some(info)) => {
+            let skipped = shared.config.lock().unwrap().skipped_version.as_deref()
+                == Some(info.tag.as_str());
+            if !manual && skipped {
+                return;
+            }
+            let notify = {
+                let mut st = shared.update.lock().unwrap();
+                st.available = Some(info);
+                st.error = None;
+                let notify = manual || !st.notified;
+                st.notified = true;
+                notify
+            };
+            refresh_update_menu();
+            shared.repaint();
+            if notify {
+                open_settings();
+            }
+        }
+    }
+}
+
+fn refresh_update_menu() {
+    STATE.with(|s| {
+        let guard = s.borrow();
+        let Some(st) = guard.as_ref() else { return };
+        let text = match &st.shared.update.lock().unwrap().available {
+            Some(info) => format!("업데이트 v{} 설치...", info.version_text()),
+            None => UPDATE_MENU_CHECK.to_string(),
+        };
+        st.update_item.set_text(text);
+    });
+}
+
+/// 트레이 업데이트 항목: 설치 가능한 버전이 있으면 설정 창, 없으면 즉시 확인
+fn on_update_menu() {
+    let pending = with_shared(|sh| sh.update.lock().unwrap().available.is_some()).unwrap_or(false);
+    if pending {
+        open_settings();
+    } else {
+        start_update_check(true);
+    }
+}
+
+/// 메시지 상자는 모달 루프 동안 트레이 이벤트 처리를 막지 않도록 별도 스레드에서 표시
+fn message_box(text: String, icon: MESSAGEBOX_STYLE) {
+    thread::spawn(move || unsafe {
+        MessageBoxW(
+            None,
+            &HSTRING::from(text),
+            &HSTRING::from(format!("{APP_NAME} 업데이트")),
+            MB_OK | icon | MB_TOPMOST | MB_SETFOREGROUND,
+        );
+    });
 }
 
 fn reload_hotkeys() {

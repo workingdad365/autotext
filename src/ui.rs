@@ -7,7 +7,7 @@ use eframe::egui;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use crate::config::{APP_NAME, APP_VERSION, Config, InputMode, Snippet, available_keys};
-use crate::{Shared, autostart};
+use crate::{Shared, autostart, service, update};
 
 const ICON_PNG: &[u8] = include_bytes!("../assets/autotext.png");
 
@@ -72,11 +72,16 @@ struct SettingsApp {
     first_frame: bool,
     /// Windows 시작 시 자동 실행 여부 (레지스트리 기준)
     autostart: bool,
+    /// 새 버전 자동 확인 여부 (설정 파일 기준)
+    check_updates: bool,
 }
 
 impl SettingsApp {
     fn new(shared: Arc<Shared>) -> Self {
-        let first = shared.config.lock().unwrap().snippets.first().cloned();
+        let (first, check_updates) = {
+            let cfg = shared.config.lock().unwrap();
+            (cfg.snippets.first().cloned(), cfg.check_updates)
+        };
         Self {
             shared,
             keys: available_keys(),
@@ -85,6 +90,116 @@ impl SettingsApp {
             message: None,
             first_frame: true,
             autostart: autostart::is_enabled(),
+            check_updates,
+        }
+    }
+
+    /// 상용구 외 설정 변경을 설정 파일에 반영
+    fn save_config(&mut self, edit: impl FnOnce(&mut Config)) -> Result<(), String> {
+        let mut cfg = self.shared.config.lock().unwrap();
+        let mut next = cfg.clone();
+        edit(&mut next);
+        next.save().map_err(|e| format!("설정 파일 저장 실패: {e}"))?;
+        *cfg = next;
+        Ok(())
+    }
+
+    fn toggle_check_updates(&mut self) {
+        let enabled = self.check_updates;
+        match self.save_config(|c| c.check_updates = enabled) {
+            Ok(()) => {
+                if enabled {
+                    self.shared.post_service(service::WM_APP_CHECK_UPDATE, 0);
+                }
+            }
+            Err(e) => {
+                self.check_updates = !enabled;
+                self.message = Some(Message::Error(e));
+            }
+        }
+    }
+
+    fn skip_update(&mut self, info: &update::UpdateInfo) {
+        let tag = info.tag.clone();
+        if let Err(e) = self.save_config(|c| c.skipped_version = Some(tag)) {
+            self.message = Some(Message::Error(e));
+            return;
+        }
+        self.shared.update.lock().unwrap().available = None;
+        self.shared.post_service(service::WM_APP_UPDATE_CHANGED, 0);
+    }
+
+    /// 설치 파일 다운로드 후 설치기를 실행하고 프로그램 종료 (설치기가 교체 후 다시 실행함)
+    fn install_update(&mut self, info: update::UpdateInfo) {
+        {
+            let mut st = self.shared.update.lock().unwrap();
+            st.progress = Some(0.0);
+            st.error = None;
+        }
+        let shared = self.shared.clone();
+        std::thread::spawn(move || {
+            let result = update::download(&info, |p| {
+                shared.update.lock().unwrap().progress = Some(p);
+                shared.repaint();
+            })
+            .and_then(|path| update::run_installer(&path));
+            match result {
+                Ok(()) => shared.post_service(service::WM_APP_QUIT, 0),
+                Err(e) => {
+                    let mut st = shared.update.lock().unwrap();
+                    st.progress = None;
+                    st.error = Some(e);
+                    drop(st);
+                    shared.repaint();
+                }
+            }
+        });
+    }
+
+    fn update_banner(&mut self, ui: &mut egui::Ui) {
+        let (info, progress, error) = {
+            let st = self.shared.update.lock().unwrap();
+            (st.available.clone(), st.progress, st.error.clone())
+        };
+        let Some(info) = info else { return };
+
+        let mut install = false;
+        let mut skip = false;
+        egui::Panel::top("update").show(ui, |ui| {
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.strong(format!("새 버전 v{} 이 있습니다.", info.version_text()));
+                ui.weak(format!("(현재 {APP_VERSION})"));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let busy = progress.is_some();
+                    skip = ui.add_enabled(!busy, egui::Button::new("이 버전 건너뛰기")).clicked();
+                    install = ui.add_enabled(!busy, egui::Button::new("지금 설치")).clicked();
+                });
+            });
+            if let Some(p) = progress {
+                ui.add(egui::ProgressBar::new(p).show_percentage().text(format!(
+                    "다운로드 중... {:.0}%  (완료되면 잠시 종료된 뒤 자동으로 다시 실행됩니다)",
+                    p * 100.0
+                )));
+            }
+            if let Some(e) = &error {
+                ui.colored_label(ui.visuals().error_fg_color, format!("업데이트 실패: {e}"));
+            }
+            let notes = info.notes.trim();
+            if !notes.is_empty() {
+                egui::CollapsingHeader::new("변경 내용").show(ui, |ui| {
+                    egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
+                        ui.label(notes);
+                    });
+                });
+            }
+            ui.add_space(4.0);
+        });
+
+        if install {
+            self.install_update(info);
+        } else if skip {
+            self.skip_update(&info);
         }
     }
 
@@ -365,11 +480,20 @@ impl eframe::App for SettingsApp {
 
         let config = self.shared.config.lock().unwrap().clone();
 
+        self.update_banner(ui);
+
         let mut autostart_changed = false;
+        let mut check_updates_changed = false;
         egui::Panel::bottom("footer").show(ui, |ui| {
             ui.horizontal(|ui| {
                 autostart_changed = ui
                     .checkbox(&mut self.autostart, "Windows 시작 시 자동 실행")
+                    .changed();
+                check_updates_changed = ui
+                    .checkbox(&mut self.check_updates, "새 버전 자동 확인")
+                    .on_hover_text(
+                        "시작 직후와 하루 한 번 GitHub 릴리스를 확인합니다.\n트레이 메뉴의 '업데이트 확인'으로 언제든 직접 확인할 수 있습니다.",
+                    )
                     .changed();
                 ui.separator();
                 ui.weak(format!("{APP_NAME} {APP_VERSION}"));
@@ -378,6 +502,9 @@ impl eframe::App for SettingsApp {
         });
         if autostart_changed {
             self.toggle_autostart();
+        }
+        if check_updates_changed {
+            self.toggle_check_updates();
         }
 
         egui::Panel::left("list")

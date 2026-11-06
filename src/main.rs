@@ -6,6 +6,7 @@ mod config;
 mod input;
 mod service;
 mod ui;
+mod update;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicIsize, Ordering};
@@ -33,20 +34,28 @@ pub struct Shared {
     /// 설정 창 HWND (닫혀 있으면 0)
     pub ui_hwnd: AtomicIsize,
     pub service_hwnd: AtomicIsize,
+    pub update: Mutex<update::UpdateState>,
 }
 
 impl Shared {
     pub fn request_reload(&self) {
+        self.post_service(service::WM_APP_RELOAD, 0);
+    }
+
+    /// 서비스 스레드의 메시지 전용 창에 메시지 전달
+    pub fn post_service(&self, msg: u32, wparam: usize) {
         let h = self.service_hwnd.load(Ordering::SeqCst);
         if h != 0 {
             unsafe {
-                let _ = PostMessageW(
-                    Some(HWND(h as *mut _)),
-                    service::WM_APP_RELOAD,
-                    WPARAM(0),
-                    LPARAM(0),
-                );
+                let _ = PostMessageW(Some(HWND(h as *mut _)), msg, WPARAM(wparam), LPARAM(0));
             }
+        }
+    }
+
+    /// 설정 창이 열려 있으면 다시 그리도록 요청
+    pub fn repaint(&self) {
+        if let Some(ctx) = self.egui_ctx.lock().unwrap().as_ref() {
+            ctx.request_repaint();
         }
     }
 }
@@ -81,6 +90,7 @@ fn main() {
         egui_ctx: Mutex::new(None),
         ui_hwnd: AtomicIsize::new(0),
         service_hwnd: AtomicIsize::new(0),
+        update: Mutex::new(update::UpdateState::default()),
     });
 
     let (tx, rx) = mpsc::channel();
