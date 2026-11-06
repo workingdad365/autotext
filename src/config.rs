@@ -6,6 +6,9 @@ use serde::{Deserialize, Serialize};
 
 pub const APP_NAME: &str = "AutoText";
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// 내보내기 파일 형식 식별자
+pub const EXPORT_FORMAT: &str = "autotext-snippets";
+const EXPORT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -133,6 +136,54 @@ impl Default for Config {
     }
 }
 
+#[derive(Serialize)]
+struct SnippetExport<'a> {
+    format: &'a str,
+    version: u32,
+    snippets: &'a [Snippet],
+}
+
+/// 내보내기 파일과 config.json 을 모두 읽기 위한 형식 (snippets 필드는 필수)
+#[derive(Deserialize)]
+struct SnippetImport {
+    #[serde(default)]
+    format: Option<String>,
+    snippets: Vec<Snippet>,
+}
+
+/// 불러오기 결과 집계
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ImportSummary {
+    /// 추가된 상용구 수
+    pub added: usize,
+    /// 기존 항목과 완전히 같아 건너뛴 수
+    pub duplicates: usize,
+    /// 핫키 충돌로 사용 안 함 상태로 추가된 수
+    pub disabled: usize,
+    /// 내용이 비었거나 핫키가 잘못되어 건너뛴 수
+    pub invalid: usize,
+}
+
+impl ImportSummary {
+    pub fn describe(&self) -> String {
+        let mut s = format!("{}개를 불러왔습니다.", self.added);
+        let mut extra = Vec::new();
+        if self.duplicates > 0 {
+            extra.push(format!("중복 {}개 건너뜀", self.duplicates));
+        }
+        if self.disabled > 0 {
+            extra.push(format!("핫키 충돌 {}개 사용 안 함", self.disabled));
+        }
+        if self.invalid > 0 {
+            extra.push(format!("잘못된 항목 {}개 건너뜀", self.invalid));
+        }
+        if !extra.is_empty() {
+            s.push_str(&format!(" ({})", extra.join(", ")));
+        }
+        s
+    }
+}
+
 impl Config {
     pub fn next_id(&self) -> u64 {
         self.snippets.iter().map(|s| s.id).max().unwrap_or(0) + 1
@@ -168,6 +219,54 @@ impl Config {
 
     pub fn remove(&mut self, id: u64) {
         self.snippets.retain(|s| s.id != id);
+    }
+
+    /// 상용구 목록만 내보내기용 JSON 으로 변환
+    pub fn export_json(&self) -> String {
+        let export = SnippetExport { format: EXPORT_FORMAT, version: EXPORT_VERSION, snippets: &self.snippets };
+        serde_json::to_string_pretty(&export).unwrap_or_default()
+    }
+
+    /// 내보내기 파일 또는 config.json 에서 상용구 목록 추출
+    pub fn parse_import(json: &str) -> Result<Vec<Snippet>, String> {
+        let json = json.trim_start_matches('\u{feff}');
+        let data: SnippetImport =
+            serde_json::from_str(json).map_err(|e| format!("상용구 파일 형식이 아닙니다: {e}"))?;
+        if let Some(format) = &data.format
+            && format != EXPORT_FORMAT
+        {
+            return Err(format!("지원하지 않는 파일 형식입니다: {format}"));
+        }
+        Ok(data.snippets)
+    }
+
+    /// 상용구 추가. replace 이면 기존 목록을 비운 뒤 추가하고, id 는 새로 매김
+    pub fn import_snippets(&mut self, snippets: Vec<Snippet>, replace: bool) -> ImportSummary {
+        let mut summary = ImportSummary::default();
+        if replace {
+            self.snippets.clear();
+        }
+        for mut s in snippets {
+            if s.text.is_empty() || s.hotkey.validate().is_err() {
+                summary.invalid += 1;
+                continue;
+            }
+            if self.snippets.iter().any(|e| {
+                e.name == s.name && e.text == s.text && e.mode == s.mode && e.hotkey.same_combo(&s.hotkey)
+            }) {
+                summary.duplicates += 1;
+                continue;
+            }
+            s.id = self.next_id();
+            // 내용, 핫키 검증은 위에서 끝났으므로 남은 실패 사유는 핫키 충돌뿐임
+            if s.enabled && self.validate_snippet(&s).is_err() {
+                s.enabled = false;
+                summary.disabled += 1;
+            }
+            self.snippets.push(s);
+            summary.added += 1;
+        }
+        summary
     }
 
     pub fn path() -> PathBuf {
@@ -355,6 +454,85 @@ mod tests {
         // 업데이트 필드가 없는 기존 설정 호환: 자동 확인 사용
         assert!(partial.check_updates);
         assert_eq!(partial.skipped_version, None);
+    }
+
+    #[test]
+    fn export_import_roundtrip() {
+        let mut cfg = Config::default();
+        cfg.upsert(snip(3, hk(false, true, false, false, "A"), true));
+        let mut paste = snip(7, hk(false, false, false, false, "F2"), false);
+        paste.mode = InputMode::Paste;
+        cfg.upsert(paste);
+        cfg.skipped_version = Some("v9.9.9".into());
+
+        let json = cfg.export_json();
+        assert!(json.contains(EXPORT_FORMAT), "{json}");
+        // 상용구 외 설정은 내보내지 않음
+        assert!(!json.contains("skipped_version"), "{json}");
+
+        let parsed = Config::parse_import(&json).unwrap();
+        assert_eq!(parsed, cfg.snippets);
+
+        let mut fresh = Config::default();
+        let summary = fresh.import_snippets(parsed, false);
+        assert_eq!(summary, ImportSummary { added: 2, ..Default::default() });
+        assert_eq!(fresh.snippets.iter().map(|s| s.id).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(fresh.snippets[1].mode, InputMode::Paste);
+        assert!(!fresh.snippets[1].enabled);
+    }
+
+    #[test]
+    fn parse_import_accepts_config_and_bom() {
+        let cfg_json = "\u{feff}{\"snippets\":[{\"id\":1,\"text\":\"x\"}],\"check_updates\":false}";
+        assert_eq!(Config::parse_import(cfg_json).unwrap().len(), 1);
+        assert!(Config::parse_import(r#"{"format":"other","snippets":[]}"#).is_err());
+        assert!(Config::parse_import(r#"{"items":[]}"#).is_err());
+        assert!(Config::parse_import("not json").is_err());
+    }
+
+    #[test]
+    fn import_merge_rules() {
+        let mut cfg = Config::default();
+        cfg.upsert(snip(1, hk(false, true, false, false, "A"), true));
+
+        let mut same = snip(10, hk(false, true, false, false, "A"), true);
+        same.name = "s1".into();
+        let mut conflict = snip(11, hk(false, true, false, false, "A"), true);
+        conflict.text = "other".into();
+        let mut empty = snip(12, hk(false, true, false, false, "B"), true);
+        empty.text.clear();
+        let bad_key = snip(13, hk(false, false, false, false, "A"), true);
+        let ok = snip(14, hk(false, true, false, false, "C"), true);
+        // 불러오는 항목끼리의 충돌도 처리
+        let mut ok_conflict = snip(15, hk(false, true, false, false, "C"), true);
+        ok_conflict.text = "again".into();
+
+        let summary = cfg.import_snippets(vec![same, conflict, empty, bad_key, ok, ok_conflict], false);
+        assert_eq!(summary, ImportSummary { added: 3, duplicates: 1, disabled: 2, invalid: 2 });
+        assert_eq!(cfg.snippets.len(), 4);
+        assert_eq!(cfg.snippets.iter().map(|s| s.id).collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+        assert_eq!(cfg.snippets.iter().map(|s| s.enabled).collect::<Vec<_>>(), vec![true, false, true, false]);
+    }
+
+    #[test]
+    fn import_replace() {
+        let mut cfg = Config::default();
+        cfg.upsert(snip(5, hk(false, true, false, false, "A"), true));
+        let summary = cfg.import_snippets(vec![snip(9, hk(false, true, false, false, "A"), true)], true);
+        assert_eq!(summary.added, 1);
+        assert_eq!(cfg.snippets.len(), 1);
+        assert_eq!(cfg.snippets[0].id, 1);
+        assert!(cfg.snippets[0].enabled);
+    }
+
+    #[test]
+    fn import_summary_text() {
+        assert_eq!(ImportSummary { added: 2, ..Default::default() }.describe(), "2개를 불러왔습니다.");
+        let s = ImportSummary { added: 1, duplicates: 1, disabled: 1, invalid: 1 };
+        assert_eq!(
+            s.describe(),
+            "1개를 불러왔습니다. (중복 1개 건너뜀, 핫키 충돌 1개 사용 안 함, 잘못된 항목 1개 건너뜀)"
+        );
     }
 
     #[test]

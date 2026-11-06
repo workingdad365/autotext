@@ -3,6 +3,7 @@
 mod autostart;
 mod clipboard;
 mod config;
+mod dialog;
 mod input;
 mod service;
 mod ui;

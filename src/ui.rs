@@ -7,7 +7,7 @@ use eframe::egui;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 use crate::config::{APP_NAME, APP_VERSION, Config, InputMode, Snippet, available_keys};
-use crate::{Shared, autostart, service, update};
+use crate::{Shared, autostart, dialog, service, update};
 
 const ICON_PNG: &[u8] = include_bytes!("../assets/autotext.png");
 
@@ -61,6 +61,12 @@ enum Message {
     Error(String),
 }
 
+/// 파일을 고른 뒤 추가/교체 선택을 기다리는 불러오기
+struct PendingImport {
+    file_name: String,
+    snippets: Vec<Snippet>,
+}
+
 struct SettingsApp {
     shared: Arc<Shared>,
     keys: Vec<String>,
@@ -74,6 +80,7 @@ struct SettingsApp {
     autostart: bool,
     /// 새 버전 자동 확인 여부 (설정 파일 기준)
     check_updates: bool,
+    pending_import: Option<PendingImport>,
 }
 
 impl SettingsApp {
@@ -91,6 +98,7 @@ impl SettingsApp {
             first_frame: true,
             autostart: autostart::is_enabled(),
             check_updates,
+            pending_import: None,
         }
     }
 
@@ -299,10 +307,134 @@ impl SettingsApp {
         }
     }
 
+    /// 저장된 상용구 목록을 JSON 파일로 내보내기
+    fn export_snippets(&mut self) {
+        let owner = self.shared.ui_hwnd.load(Ordering::SeqCst);
+        let Some(path) = dialog::save_json(owner, "상용구 내보내기", "AutoText-snippets.json") else { return };
+        let (json, count) = {
+            let cfg = self.shared.config.lock().unwrap();
+            (cfg.export_json(), cfg.snippets.len())
+        };
+        self.message = Some(match std::fs::write(&path, json) {
+            Ok(()) => Message::Info(format!("{count}개를 내보냈습니다.")),
+            Err(e) => Message::Error(format!("내보내기 실패: {e}")),
+        });
+    }
+
+    /// 파일을 읽어 추가/교체 선택 대화상자를 띄움
+    fn begin_import(&mut self) {
+        let owner = self.shared.ui_hwnd.load(Ordering::SeqCst);
+        let Some(path) = dialog::open_json(owner, "상용구 불러오기") else { return };
+        let parsed = std::fs::read_to_string(&path)
+            .map_err(|e| format!("파일을 읽을 수 없습니다: {e}"))
+            .and_then(|s| Config::parse_import(&s));
+        match parsed {
+            Ok(snippets) if snippets.is_empty() => {
+                self.message = Some(Message::Error("파일에 상용구가 없습니다.".into()));
+            }
+            Ok(snippets) => {
+                let file_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                self.pending_import = Some(PendingImport { file_name, snippets });
+            }
+            Err(e) => self.message = Some(Message::Error(e)),
+        }
+    }
+
+    fn apply_import(&mut self, pending: PendingImport, replace: bool) {
+        let result = {
+            let mut cfg = self.shared.config.lock().unwrap();
+            let mut next = cfg.clone();
+            let summary = next.import_snippets(pending.snippets, replace);
+            match next.save() {
+                Ok(()) => {
+                    *cfg = next;
+                    Ok((summary, cfg.clone()))
+                }
+                Err(e) => Err(format!("설정 파일 저장 실패: {e}")),
+            }
+        };
+        match result {
+            Ok((summary, cfg)) => {
+                // 추가 모드에서는 기존 항목 편집을 유지하고, 그 외에는 첫 항목을 선택
+                let keep = !replace
+                    && self.original.as_ref().is_some_and(|o| cfg.snippets.iter().any(|s| s.id == o.id));
+                if !keep {
+                    let first = cfg.snippets.first().cloned();
+                    self.draft = first.clone();
+                    self.original = first;
+                }
+                self.message = Some(Message::Info(summary.describe()));
+                self.shared.request_reload();
+            }
+            Err(e) => self.message = Some(Message::Error(e)),
+        }
+    }
+
+    fn import_modal(&mut self, ctx: &egui::Context) {
+        let Some(pending) = &self.pending_import else { return };
+        let dirty = self.is_dirty();
+        let mut choice: Option<bool> = None;
+        let mut cancel = false;
+        let resp = egui::Modal::new(egui::Id::unique("import_modal")).show(ctx, |ui| {
+            ui.set_width(380.0);
+            ui.heading("상용구 불러오기");
+            ui.add_space(6.0);
+            ui.label(format!("'{}' 에서 상용구 {}개를 찾았습니다.", pending.file_name, pending.snippets.len()));
+            ui.add_space(4.0);
+            ui.weak("추가: 기존 목록 뒤에 붙입니다. 완전히 같은 항목은 건너뛰고, 핫키가 겹치면 사용 안 함으로 추가합니다.");
+            ui.weak("기존 목록 바꾸기: 현재 상용구를 모두 지우고 파일의 상용구로 바꿉니다.");
+            if dirty {
+                ui.add_space(4.0);
+                ui.colored_label(ui.visuals().warn_fg_color, "편집 중인 저장하지 않은 내용은 사라질 수 있습니다.");
+            }
+            ui.add_space(10.0);
+            ui.horizontal(|ui| {
+                if ui.button("추가").clicked() {
+                    choice = Some(false);
+                }
+                if ui.button("기존 목록 바꾸기").clicked() {
+                    choice = Some(true);
+                }
+                if ui.button("취소").clicked() {
+                    cancel = true;
+                }
+            });
+        });
+        if let Some(replace) = choice {
+            if let Some(pending) = self.pending_import.take() {
+                self.apply_import(pending, replace);
+            }
+        } else if cancel || resp.should_close() {
+            self.pending_import = None;
+        }
+    }
+
+    fn message_ui(&self, ui: &mut egui::Ui) {
+        match &self.message {
+            Some(Message::Info(m)) => {
+                ui.label(m);
+            }
+            Some(Message::Error(m)) => {
+                ui.colored_label(ui.visuals().error_fg_color, m);
+            }
+            None => {}
+        }
+    }
+
     fn list_ui(&mut self, ui: &mut egui::Ui, config: &Config) {
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui.button("+ 새 상용구").clicked() {
                 self.new_snippet();
+            }
+            if ui.button("불러오기").on_hover_text("JSON 파일에서 상용구를 불러옵니다.").clicked() {
+                self.begin_import();
+            }
+            if ui
+                .add_enabled(!config.snippets.is_empty(), egui::Button::new("내보내기"))
+                .on_hover_text("저장된 상용구를 JSON 파일로 내보냅니다.")
+                .clicked()
+            {
+                self.export_snippets();
             }
         });
         ui.separator();
@@ -351,6 +483,8 @@ impl SettingsApp {
             ui.add_space(40.0);
             ui.vertical_centered(|ui| {
                 ui.label("왼쪽 목록에서 상용구를 선택하거나 '+ 새 상용구' 버튼을 누르세요.");
+                ui.add_space(8.0);
+                self.message_ui(ui);
             });
             return;
         };
@@ -444,15 +578,7 @@ impl SettingsApp {
             if !is_new && ui.button("삭제").clicked() {
                 do_delete = true;
             }
-            match &self.message {
-                Some(Message::Info(m)) => {
-                    ui.label(m);
-                }
-                Some(Message::Error(m)) => {
-                    ui.colored_label(ui.visuals().error_fg_color, m);
-                }
-                None => {}
-            }
+            self.message_ui(ui);
         });
 
         if do_save {
@@ -520,6 +646,9 @@ impl eframe::App for SettingsApp {
             ui.add_space(6.0);
             self.editor_ui(ui, &config);
         });
+
+        let ctx = ui.ctx().clone();
+        self.import_modal(&ctx);
     }
 }
 

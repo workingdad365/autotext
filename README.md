@@ -16,6 +16,7 @@
 - **두 가지 입력 방식**
   - 직접 입력: 한 글자씩 키 입력으로 전송하며 클립보드를 건드리지 않음
   - 클립보드 붙여넣기: `Ctrl+V` 로 붙여넣은 뒤 기존 클립보드 내용을 복원함
+- **내보내기/불러오기**: 상용구 목록을 JSON 파일로 내보내고, 다른 PC 나 백업 파일에서 불러올 수 있음
 - **Windows 시작 시 자동 실행**: 설정 창에서 켜고 끌 수 있음
 - **자동 업데이트**: GitHub 릴리스에 새 버전이 올라오면 알리고, 버튼 한 번으로 설치 후 다시 실행함
 - **중복 실행 방지**: 다시 실행하면 이미 실행 중인 프로그램의 설정 창이 열림
@@ -84,9 +85,31 @@
 - 상용구와 복원한 내용은 Win+V 클립보드 기록과 클라우드 동기화에서 제외됨
 - 클립보드를 사용할 수 없으면 직접 입력으로 대체함
 
+### 내보내기와 불러오기
+
+설정 창 왼쪽 목록 상단의 버튼으로 상용구를 백업하거나 다른 PC 로 옮길 수 있다.
+
+- **내보내기**: 저장된 상용구 전체를 JSON 파일로 저장함 (자동 실행, 업데이트 설정은 포함하지 않음)
+- **불러오기**: JSON 파일을 고른 뒤 처리 방식을 선택함
+  - **추가**: 기존 목록 뒤에 붙임. 이름, 내용, 핫키, 입력 방식이 모두 같은 항목은 건너뛰고,
+    사용 중인 핫키와 겹치는 항목은 **사용 안 함** 상태로 추가됨
+  - **기존 목록 바꾸기**: 현재 상용구를 모두 지우고 파일의 상용구로 바꿈
+- 내용이 비었거나 핫키가 잘못된 항목은 건너뛰며, 처리 결과는 설정 창에 표시됨
+- 내보낸 파일 외에 `config.json` 도 그대로 불러올 수 있음
+
 ## 설정 파일
 
-상용구는 `%APPDATA%\AutoText\config.json` 에 저장된다. 백업하거나 다른 PC 로 옮길 때 이 파일을 복사하면 된다.
+상용구는 `%APPDATA%\AutoText\config.json` 에 저장된다. 백업하거나 다른 PC 로 옮길 때 이 파일을 복사하거나, 설정 창의 **내보내기/불러오기** 를 사용하면 된다.
+
+내보내기 파일은 다음과 같은 형식이다.
+
+```json
+{
+  "format": "autotext-snippets",
+  "version": 1,
+  "snippets": [ { "id": 1, "name": "인사말", "text": "...", "hotkey": { ... }, "enabled": true, "mode": "paste" } ]
+}
+```
 
 ```json
 {
@@ -188,7 +211,8 @@ autotext/
 |   +-- autotext.png    # 창 아이콘
 +-- src/
 |   +-- main.rs         # 진입점, 중복 실행 방지, 스레드 간 공유 상태
-|   +-- config.rs       # 상용구 모델, 핫키 검증, 설정 파일 저장/로드
+|   +-- config.rs       # 상용구 모델, 핫키 검증, 설정 파일 저장/로드, 내보내기/불러오기
+|   +-- dialog.rs       # 파일 열기/저장 대화상자 (Win32)
 |   +-- service.rs      # 트레이 아이콘, 전역 핫키 등록 (백그라운드 Win32 스레드)
 |   +-- input.rs        # SendInput 기반 직접 입력, 붙여넣기 입력
 |   +-- clipboard.rs    # 클립보드 백업, 설정, 복원
@@ -217,6 +241,6 @@ autotext/
 |---|---|
 | [eframe / egui](https://github.com/emilk/egui) | 설정 창 UI |
 | [tray-icon](https://github.com/tauri-apps/tray-icon) | 트레이 아이콘, 우클릭 메뉴 |
-| [windows](https://github.com/microsoft/windows-rs) | 핫키, 키 입력, 클립보드, 레지스트리, WinHTTP Win32 API |
+| [windows](https://github.com/microsoft/windows-rs) | 핫키, 키 입력, 클립보드, 레지스트리, WinHTTP, 파일 대화상자 Win32 API |
 | [serde / serde_json](https://serde.rs) | 설정 파일 직렬화 |
 | [winresource](https://github.com/BenjaminRi/winresource) | exe 아이콘, 버전 정보 리소스 |
